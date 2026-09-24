@@ -21,7 +21,16 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-const MODEL = "mistral-large-latest";
+// Reihenfolge der Modelle. Erlaubt das Mistral-Abo ein Modell nicht (403 tier_not_allowed),
+// wird automatisch das naechste versucht. Mit dem Secret MISTRAL_MODEL laesst sich ein
+// bestimmtes Modell erzwingen. Alle Modelle sind Mistral (EU).
+const MODELS = [
+  Deno.env.get("MISTRAL_MODEL"),
+  "mistral-large-latest",
+  "mistral-medium-latest",
+  "mistral-small-latest",
+].filter((m, i, a): m is string => !!m && a.indexOf(m) === i);
+let aktivesModell: string | null = null; // gemerkt fuer die Lebensdauer der Instanz
 const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
 const MAX_TOOL_ROUNDS = 6;
 const SUPPORTED_CANTONS = ["ZH", "TG"];
@@ -404,19 +413,28 @@ class HttpError extends Error {
 }
 
 async function callMistral(apiKey: string, messages: any[]) {
-  const resp = await fetch(MISTRAL_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: MODEL, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
-  });
-  if (!resp.ok) {
+  const kandidaten = aktivesModell ? [aktivesModell, ...MODELS.filter((m) => m !== aktivesModell)] : MODELS;
+
+  for (const model of kandidaten) {
+    const resp = await fetch(MISTRAL_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
+    });
+    if (resp.ok) {
+      if (aktivesModell !== model) console.log(`Mistral-Modell aktiv: ${model}`);
+      aktivesModell = model;
+      return { ...(await resp.json()), _model: model };
+    }
     const txt = await resp.text();
-    console.error("Mistral-Fehler", resp.status, txt);
+    console.error("Mistral-Fehler", model, resp.status, txt);
+    // Modell im Abo nicht verfuegbar oder unbekannt -> naechstes Modell
+    if (resp.status === 403 || resp.status === 404 || (resp.status === 400 && /model/i.test(txt))) continue;
     if (resp.status === 429) throw new HttpError(429, "Rate limit erreicht, bitte spaeter nochmal.");
     if (resp.status === 401) throw new HttpError(500, "MISTRAL_API_KEY ungueltig.");
     throw new HttpError(502, `KI-Dienst nicht erreichbar (${resp.status}).`);
   }
-  return await resp.json();
+  throw new HttpError(502, "Kein Mistral-Modell im aktuellen Abo verfuegbar.");
 }
 
 // ---------------------------------------------------------------------------
@@ -479,9 +497,11 @@ Deno.serve(async (req) => {
     const ctx: Ctx = { db, userId: user.id, profile };
     const protokoll: any[] = [];
     let antwort = "";
+    let modell = "";
 
     for (let runde = 0; runde <= MAX_TOOL_ROUNDS; runde++) {
       const data = await callMistral(apiKey, messages);
+      modell = data._model;
       const msg = data.choices?.[0]?.message;
       const calls = msg?.tool_calls ?? [];
 
@@ -515,7 +535,7 @@ Deno.serve(async (req) => {
     await db.from("tax_messages").insert({
       conversation_id: convId, user_id: user.id, role: "assistant", content: antwort,
       tool_calls: protokoll.length ? protokoll : null,
-      metadata: { model: MODEL, werkzeuge: protokoll.map((p) => p.werkzeug) },
+      metadata: { model: modell, werkzeuge: protokoll.map((p) => p.werkzeug) },
     });
     await db.from("tax_conversations").update({ updated_at: new Date().toISOString() }).eq("id", convId);
 
