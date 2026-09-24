@@ -1,97 +1,528 @@
-// Edge Function: ai-financial-advisor
-// Täglicher Cron-Job (z.B. 6 Uhr): analysiert Journal & Belege pro User und
-// erzeugt max. 5 Insights/Tag (Anomalien, Sparpotenzial, Cashflow, Steuern, Compliance).
+// supabase/functions/ai-tax-advisor/index.ts
 //
-// Secrets: OPENAI_API_KEY, CRON_SECRET
+// KI-Steuer- und Finanzassistent fuer BizManager.
+//
+// Grundsaetze:
+//  1. Zahlen kommen AUSSCHLIESSLICH aus Datenbankfunktionen (Werkzeuge).
+//     Das Sprachmodell rechnet keine Steuer- oder Summenwerte selbst.
+//  2. Alle Datenzugriffe laufen mit dem Token des Nutzers (RLS greift).
+//     Kein Service-Key noetig -> unabhaengig von der Key-Rotation.
+//  3. Modell: Mistral (EU). Kein stiller Fallback auf andere Anbieter.
+//  4. Jeder Werkzeugaufruf wird in tax_messages.tool_calls protokolliert.
+//
+// WICHTIG fuer Lovable: Diese Datei nicht umschreiben. Aenderungen am
+// Backend laufen ueber Claude Code (siehe CLAUDE.md).
 
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { publishableKey, supabaseUrl } from "../_shared/keys.ts";
 
-const SYSTEM_PROMPT = `Du bist ein proaktiver Schweizer Finanzberater für KMU und Privatpersonen.
-Analysiere die Buchhaltungsdaten und generiere 1-5 konkrete, umsetzbare Insights.
-Kategorien: anomaly (ungewöhnliche Ausgaben), savings (Sparpotenzial, z.B. Abos),
-cashflow (30-Tage-Prognose), tax (Säule 3a, Pendlerabzug, Abzüge),
-compliance (MWST-Fristen, Belegpflicht).
-Antworte NUR mit validem JSON: {"insights": [{"category": "...", "title": "...", "body": "..."}]}
-Titel max. 80 Zeichen, Body max. 300 Zeichen, auf Deutsch, konkret mit Zahlen wo möglich.`;
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+const MODEL = "mistral-large-latest";
+const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
+const MAX_TOOL_ROUNDS = 6;
+const SUPPORTED_CANTONS = ["ZH", "TG"];
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+
+// ---------------------------------------------------------------------------
+// Werkzeug-Definitionen (Mistral / OpenAI-kompatibles Format)
+// ---------------------------------------------------------------------------
+
+const jahr = { type: "integer", description: "Steuerjahr, z.B. 2026" };
+const kanton = { type: "string", enum: SUPPORTED_CANTONS, description: "Kanton (nur ZH und TG unterstuetzt)" };
+const zivilstand = { type: "string", enum: ["single", "married"], description: "single = ledig/geschieden/verwitwet, married = verheiratet" };
+
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "ausgaben_nach_kategorie",
+      description:
+        "Summe und Anzahl der Belege einer Kategorie, aufgeteilt nach Jahr. Ohne Kategorie: Ueberblick ueber alle Kategorien. " +
+        "Fuer Fragen wie 'wie viele Bussen hatte ich', 'Fahrzeugkosten 2023 bis 2025'. Kategoriename EXAKT aus der Kategorienliste verwenden.",
+      parameters: {
+        type: "object",
+        properties: {
+          kategorie: { type: "string", description: "Exakter Kategoriename aus der Liste. Leer lassen fuer alle Kategorien." },
+          von_jahr: { type: "integer", description: "Erstes Jahr (inklusive), optional" },
+          bis_jahr: { type: "integer", description: "Letztes Jahr (inklusive), optional" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "belege_suchen",
+      description: "Einzelne Belege auflisten (Datum, Lieferant, Betrag, Kategorie, steuerliche Einordnung). Hoechstens 50 Treffer.",
+      parameters: {
+        type: "object",
+        properties: {
+          kategorie: { type: "string", description: "Exakter Kategoriename, optional" },
+          lieferant: { type: "string", description: "Teil des Lieferantennamens, optional" },
+          von_jahr: { type: "integer" },
+          bis_jahr: { type: "integer" },
+          limit: { type: "integer", description: "Anzahl Treffer, Standard 20, max 50" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "geschaeftsgewinn",
+      description: "Gewinn der selbstaendigen Taetigkeit eines Jahres: Einnahmen, abziehbarer Aufwand, Abschreibungen, offene Belege.",
+      parameters: { type: "object", properties: { jahr }, required: ["jahr"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "steuererklaerung",
+      description:
+        "Vollstaendige Steuererklaerung eines Jahres aus den erfassten Daten: Einkuenfte, Abzuege, steuerbares Einkommen und Vermoegen, " +
+        "voraussichtliche Steuer. Fuer 'wie viel Steuern zahle ich', 'mein steuerbares Einkommen'. Kanton/Gemeinde kommen aus dem Profil, wenn nicht angegeben.",
+      parameters: {
+        type: "object",
+        properties: {
+          jahr,
+          kanton,
+          gemeinde: { type: "string", description: "Politische Gemeinde, z.B. 'Zürich', 'Frauenfeld'" },
+          zivilstand,
+          kinder: { type: "integer" },
+          konfession: { type: "string", enum: ["none", "prot", "cath", "christcath"] },
+          saeule3a_einbezahlt: { type: "number" },
+        },
+        required: ["jahr"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "steuer_berechnen",
+      description:
+        "Einkommens- und Vermoegenssteuer (Kanton, Gemeinde, Kirche, Personalsteuer, Bund) fuer ein GEGEBENES steuerbares Einkommen. " +
+        "Fuer hypothetische Fragen ('was zahle ich bei 80'000 steuerbarem Einkommen in Frauenfeld').",
+      parameters: {
+        type: "object",
+        properties: {
+          jahr,
+          kanton,
+          gemeinde: { type: "string" },
+          zivilstand,
+          kinder: { type: "integer", description: "Anzahl Kinder" },
+          mit_kindern_zusammenlebend: {
+            type: "boolean",
+            description: "true nur, wenn die Person mit den Kindern zusammenlebt und deren Unterhalt zur Hauptsache bestreitet (Elterntarif)",
+          },
+          steuerbares_einkommen: { type: "number" },
+          steuerbares_vermoegen: { type: "number" },
+          konfession: { type: "string", enum: ["none", "prot", "cath", "christcath"] },
+        },
+        required: ["jahr", "kanton", "gemeinde", "zivilstand", "steuerbares_einkommen"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "vermoegen",
+      description: "Vermoegen per 31.12.: Bruttovermoegen, Geschaeftsvermoegen, Schulden, steuerbares Vermoegen, Vermoegensertrag.",
+      parameters: { type: "object", properties: { jahr }, required: ["jahr"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ahv_selbstaendig",
+      description: "AHV/IV/EO-Beitrag eines Selbstaendigen fuer ein Erwerbseinkommen (amtliche sinkende Beitragsskala).",
+      parameters: {
+        type: "object",
+        properties: {
+          jahr,
+          einkommen: { type: "number", description: "Erwerbseinkommen aus selbstaendiger Taetigkeit" },
+          verwaltungskosten_prozent: { type: "number", description: "Verwaltungskostenzuschlag der Ausgleichskasse 0-5, optional" },
+        },
+        required: ["jahr", "einkommen"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ahv_uebersicht",
+      description: "Vergleich: an die Ausgleichskasse bezahlte AHV-Beitraege vs. aus dem Gewinn berechnet; Warnung bei Doppelzaehlung.",
+      parameters: { type: "object", properties: { jahr }, required: ["jahr"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "kapitalleistung_vorsorge",
+      description: "Steuer auf einen Kapitalbezug aus Pensionskasse oder Saeule 3a (Kanton + Gemeinde, ohne Bund).",
+      parameters: {
+        type: "object",
+        properties: { jahr, kanton, gemeinde: { type: "string" }, zivilstand, betrag: { type: "number" } },
+        required: ["jahr", "kanton", "gemeinde", "zivilstand", "betrag"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "firmensteuer",
+      description: "Gewinn- und Kapitalsteuer einer GmbH/AG (Bund, Kanton, Gemeinde), ESTV-Methode.",
+      parameters: {
+        type: "object",
+        properties: {
+          jahr,
+          kanton,
+          gemeinde: { type: "string" },
+          gewinn_vor_steuern: { type: "number" },
+          eigenkapital: { type: "number" },
+          total_aktiven: { type: "number" },
+        },
+        required: ["jahr", "kanton", "gemeinde", "gewinn_vor_steuern", "eigenkapital"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grundstueckgewinn",
+      description: "Grundstueckgewinnsteuer beim Verkauf einer Liegenschaft. Besitzdauer wird aus den Daten exakt berechnet.",
+      parameters: {
+        type: "object",
+        properties: {
+          jahr,
+          kanton,
+          gewinn: { type: "number", description: "Verkaufserloes minus Anlagekosten und wertvermehrende Aufwendungen" },
+          erwerbsdatum: { type: "string", description: "YYYY-MM-DD" },
+          verkaufsdatum: { type: "string", description: "YYYY-MM-DD" },
+        },
+        required: ["jahr", "kanton", "gewinn", "erwerbsdatum", "verkaufsdatum"],
+      },
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Werkzeug-Ausfuehrung
+// ---------------------------------------------------------------------------
+
+type Ctx = { db: SupabaseClient; userId: string; profile: any };
+
+function needCanton(k?: string) {
+  const c = (k || "").toUpperCase();
+  if (!SUPPORTED_CANTONS.includes(c)) {
+    throw new Error(`Kanton '${k ?? "unbekannt"}' wird nicht unterstuetzt. Die App rechnet nur fuer ZH und TG.`);
+  }
+  return c;
+}
+
+async function rpc(db: SupabaseClient, fn: string, args: Record<string, unknown>) {
+  const { data, error } = await db.rpc(fn, args);
+  if (error) throw new Error(`${fn}: ${error.message}`);
+  return data;
+}
+
+async function steuerfussKonfessionslos(db: SupabaseClient, jahrWert: number, k: string, gemeinde: string) {
+  const { data, error } = await db
+    .from("tax_multipliers")
+    .select("total_none, sub_area")
+    .eq("tax_year", jahrWert)
+    .eq("canton", k)
+    .eq("municipality", gemeinde);
+  if (error) throw new Error(error.message);
+  if (!data || data.length === 0) throw new Error(`Keine Steuerfuesse fuer ${gemeinde} (${k}) im Jahr ${jahrWert} erfasst.`);
+  const haupt = data.find((r: any) => r.sub_area === gemeinde) ?? data[0];
+  return Number(haupt.total_none) / 100;
+}
+
+async function runTool(name: string, a: any, ctx: Ctx): Promise<unknown> {
+  const { db, userId, profile } = ctx;
+
+  switch (name) {
+    case "ausgaben_nach_kategorie": {
+      if (a.kategorie) {
+        return rpc(db, "sum_receipts_by_category", {
+          _user_id: userId, _category: a.kategorie,
+          _from_year: a.von_jahr ?? null, _to_year: a.bis_jahr ?? null,
+        });
+      }
+      return rpc(db, "receipts_category_overview", {
+        _user_id: userId, _from_year: a.von_jahr ?? null, _to_year: a.bis_jahr ?? null,
+      });
+    }
+
+    case "belege_suchen": {
+      const limit = Math.min(Math.max(Number(a.limit) || 20, 1), 50);
+      let q = db
+        .from("receipts")
+        .select("receipt_date, supplier_name, amount, category, description, tax_classifications(expense_type, status, deductible_pct)")
+        .eq("user_id", userId)
+        .is("deleted_at", null)
+        .order("receipt_date", { ascending: false })
+        .limit(limit);
+      if (a.kategorie) q = q.eq("category", a.kategorie);
+      if (a.lieferant) q = q.ilike("supplier_name", `%${String(a.lieferant).replace(/[%_]/g, "")}%`);
+      if (a.von_jahr) q = q.gte("receipt_date", `${a.von_jahr}-01-01`);
+      if (a.bis_jahr) q = q.lte("receipt_date", `${a.bis_jahr}-12-31`);
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      return { anzahl: data?.length ?? 0, hinweis: `Hoechstens ${limit} Treffer. Fuer Summen ausgaben_nach_kategorie verwenden.`, belege: data };
+    }
+
+    case "geschaeftsgewinn":
+      return rpc(db, "calc_business_profit", { _user_id: userId, _year: a.jahr });
+
+    case "steuererklaerung": {
+      const k = needCanton(a.kanton ?? profile?.canton);
+      const gemeinde = a.gemeinde ?? profile?.municipality;
+      if (!gemeinde) throw new Error("Gemeinde unbekannt. Bitte den Nutzer nach seiner Wohngemeinde fragen.");
+      return rpc(db, "export_tax_return", {
+        _user_id: userId, _year: a.jahr, _canton: k, _municipality: gemeinde,
+        _marital: a.zivilstand ?? profile?.marital_status ?? "single",
+        _children: a.kinder ?? 0,
+        _confession: a.konfession ?? profile?.confession ?? "none",
+        _saeule3a_einbezahlt: a.saeule3a_einbezahlt ?? 0,
+      });
+    }
+
+    case "steuer_berechnen": {
+      const k = needCanton(a.kanton);
+      const data = await rpc(db, "calc_tax_breakdown", {
+        _year: a.jahr, _canton: k, _municipality: a.gemeinde, _marital: a.zivilstand,
+        _with_children: !!a.mit_kindern_zusammenlebend,
+        _taxable_income: a.steuerbares_einkommen,
+        _taxable_wealth: a.steuerbares_vermoegen ?? 0,
+        _confession: a.konfession ?? "none",
+        _children: a.kinder ?? 0,
+      });
+      return Array.isArray(data) ? data[0] : data;
+    }
+
+    case "vermoegen":
+      return rpc(db, "calc_net_wealth", { _user_id: userId, _year: a.jahr, _include_partner: false });
+
+    case "ahv_selbstaendig":
+      return rpc(db, "calc_ahv_selbstaendig", {
+        _year: a.jahr, _erwerbseinkommen: a.einkommen,
+        _income_is_net: false, _verwaltungskosten: a.verwaltungskosten_prozent ?? 0,
+      });
+
+    case "ahv_uebersicht":
+      return rpc(db, "ahv_payments_overview", { _user_id: userId, _year: a.jahr });
+
+    case "kapitalleistung_vorsorge": {
+      const k = needCanton(a.kanton);
+      const einfach = Number(await rpc(db, k === "ZH" ? "calc_zh_capital_payout" : "calc_tg_capital_payout", {
+        _year: a.jahr, _marital: a.zivilstand, _amount: a.betrag,
+      }));
+      const fuss = await steuerfussKonfessionslos(db, a.jahr, k, a.gemeinde);
+      return {
+        betrag: a.betrag,
+        einfache_steuer: einfach,
+        steuerfuss_konfessionslos: fuss,
+        kanton_und_gemeinde: Math.round(einfach * fuss),
+        hinweis: "Kanton + Gemeinde, konfessionslos. Direkte Bundessteuer auf Kapitalleistungen NICHT enthalten.",
+      };
+    }
+
+    case "firmensteuer": {
+      const k = needCanton(a.kanton);
+      return rpc(db, "calc_corporate_tax", {
+        _year: a.jahr, _canton: k, _municipality: a.gemeinde, _entity_type: "corporation",
+        _profit_before_tax: a.gewinn_vor_steuern, _equity: a.eigenkapital,
+        _total_assets: a.total_aktiven ?? null,
+      });
+    }
+
+    case "grundstueckgewinn": {
+      const k = needCanton(a.kanton);
+      const jahre = Number(await rpc(db, "calc_holding_years", { _acquired: a.erwerbsdatum, _sold: a.verkaufsdatum }));
+      const steuer = Number(await rpc(db, k === "ZH" ? "calc_zh_property_gain_tax" : "calc_tg_property_gain_tax", {
+        _year: a.jahr, _gain: a.gewinn, _holding_years: jahre,
+      }));
+      return {
+        kanton: k, gewinn: a.gewinn,
+        besitzdauer_jahre: jahre, volle_jahre: Math.floor(jahre),
+        grundstueckgewinnsteuer: steuer,
+      };
+    }
+
+    default:
+      throw new Error(`Unbekanntes Werkzeug: ${name}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Systemprompt
+// ---------------------------------------------------------------------------
+
+function systemPrompt(profile: any, kategorien: string[]) {
+  const heute = new Date().toISOString().split("T")[0];
+  return `Du bist der KI-Steuer- und Finanzassistent von BizManager fuer Schweizer Selbstaendige, KMU und Privatpersonen.
+Heute ist ${heute}. Antworte auf Deutsch, knapp und freundlich, mit Markdown. Betraege in CHF mit Schweizer Tausendertrennzeichen (z.B. CHF 4'280.00).
+
+EISERNE REGELN FUER ZAHLEN:
+1. Jede Zahl ueber die Daten oder Steuern des Nutzers MUSS aus einem Werkzeug stammen. Rechne keine Steuer, keine Summe und keinen Abzug selbst aus.
+2. Wenn eine Frage Nutzerdaten oder eine Steuerberechnung betrifft, rufe zuerst das passende Werkzeug auf. Rate nie.
+3. Liefert ein Werkzeug einen Fehler oder keine Daten, sag das offen ("Dazu finde ich keine Belege", "Das kann die App noch nicht berechnen"). Erfinde keine Ersatzzahl.
+4. Kategorienamen muessen EXAKT aus der Liste unten stammen. Fragt der Nutzer nach "Fahrzeugkosten", suche die passende Kategorie in der Liste (z.B. "Fahrzeug"). Passen mehrere, frage alle ab und nenne sie einzeln.
+5. Die App rechnet nur fuer die Kantone ZH und TG. Fuer andere Kantone gibt es keine Zahlen - sag das.
+6. Steuerbetraege sind Schaetzungen, keine Veranlagung. Erwaehne das bei Steuerzahlen in einem kurzen Satz.
+7. Allgemeine Fragen zum Steuerrecht darfst du ohne Werkzeug beantworten, aber ohne erfundene Zahlen zur Person. Bei verbindlichen oder komplexen Fragen auf einen Treuhaender oder das kantonale Steueramt verweisen.
+8. Nenne am Ende einer Zahlenantwort kurz die Grundlage, z.B. "(aus 3 Belegen 2023-2025)".
+
+NUTZERPROFIL:
+- Kanton: ${profile?.canton ?? "nicht erfasst"}
+- Gemeinde: ${profile?.municipality ?? "nicht erfasst"}
+- Zivilstand: ${profile?.marital_status ?? "nicht erfasst"}
+- Konfession: ${profile?.confession ?? "nicht erfasst"}
+- Kontotyp: ${profile?.account_type ?? "nicht erfasst"}
+
+KATEGORIEN DES NUTZERS (exakte Namen):
+${kategorien.length ? kategorien.map((k) => `- ${k}`).join("\n") : "- (keine Kategorien erfasst)"}`;
+}
+
+// ---------------------------------------------------------------------------
+// Mistral-Aufruf
+// ---------------------------------------------------------------------------
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+async function callMistral(apiKey: string, messages: any[]) {
+  const resp = await fetch(MISTRAL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model: MODEL, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text();
+    console.error("Mistral-Fehler", resp.status, txt);
+    if (resp.status === 429) throw new HttpError(429, "Rate limit erreicht, bitte spaeter nochmal.");
+    if (resp.status === 401) throw new HttpError(500, "MISTRAL_API_KEY ungueltig.");
+    throw new HttpError(502, `KI-Dienst nicht erreichbar (${resp.status}).`);
+  }
+  return await resp.json();
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
-  if (req.headers.get("x-cron-secret") !== Deno.env.get("CRON_SECRET")) {
-    return new Response("Unauthorized", { status: 401 });
-  }
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-  );
+  try {
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) return json({ error: "Unauthorized" }, 401);
 
-  // Alle aktiven User mit Berater-Einstellungen laden
-  const { data: profiles } = await supabase.from("profiles").select("id, account_type");
-  let generated = 0;
-
-  for (const profile of profiles ?? []) {
-    const userId = profile.id;
-
-    // Anti-Spam: max. 5 Insights pro Tag
-    const today = new Date().toISOString().slice(0, 10);
-    const { count } = await supabase
-      .from("ai_insights")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .gte("created_at", today);
-    const remaining = 5 - (count ?? 0);
-    if (remaining <= 0) continue;
-
-    // Letzte 90 Tage Buchungen als Analysebasis
-    const since = new Date(Date.now() - 90 * 86400_000).toISOString().slice(0, 10);
-    const { data: entries } = await supabase
-      .from("journal_entries")
-      .select("entry_date, description, debit_account, credit_account, amount")
-      .eq("user_id", userId)
-      .gte("entry_date", since)
-      .order("entry_date", { ascending: false })
-      .limit(300);
-
-    if (!entries || entries.length < 3) continue; // zu wenig Daten
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${Deno.env.get("OPENAI_API_KEY")}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `Kontotyp: ${profile.account_type}. Heutiges Datum: ${today}.\nBuchungen (90 Tage):\n${JSON.stringify(entries)}`,
-          },
-        ],
-      }),
+    // Ein einziger Client, mit dem Token des Nutzers: RLS schuetzt alle Zugriffe.
+    const db = createClient(supabaseUrl(), publishableKey(), {
+      global: { headers: { Authorization: authHeader } },
     });
+    const { data: { user } } = await db.auth.getUser();
+    if (!user) return json({ error: "Unauthorized" }, 401);
 
-    if (!response.ok) continue;
-    const completion = await response.json();
-
-    let insights: { category: string; title: string; body: string }[] = [];
-    try {
-      insights = JSON.parse(completion.choices[0].message.content).insights ?? [];
-    } catch {
-      continue;
+    const apiKey = Deno.env.get("MISTRAL_API_KEY");
+    if (!apiKey) {
+      console.error("MISTRAL_API_KEY fehlt");
+      return json({ error: "KI-Assistent nicht konfiguriert (MISTRAL_API_KEY fehlt)." }, 500);
     }
 
-    const valid = insights
-      .filter((i) => ["anomaly", "savings", "cashflow", "tax", "compliance"].includes(i.category))
-      .slice(0, remaining)
-      .map((i) => ({ user_id: userId, ...i }));
+    const body = await req.json().catch(() => ({}));
+    const message = body?.message;
+    let convId = body?.conversation_id;
+    if (!message || typeof message !== "string") return json({ error: "message required" }, 400);
 
-    if (valid.length > 0) {
-      await supabase.from("ai_insights").insert(valid);
-      generated += valid.length;
+    if (convId) {
+      const { data: own } = await db.from("tax_conversations").select("id").eq("id", convId).eq("user_id", user.id).maybeSingle();
+      if (!own) return json({ error: "Forbidden" }, 403);
+    } else {
+      const { data: conv, error } = await db
+        .from("tax_conversations")
+        .insert({ user_id: user.id, title: message.slice(0, 60), tax_year: new Date().getFullYear() })
+        .select("id").single();
+      if (error) throw error;
+      convId = conv.id;
     }
+
+    const [{ data: history }, { data: profile }, { data: cats }] = await Promise.all([
+      db.from("tax_messages").select("role, content").eq("conversation_id", convId).eq("user_id", user.id)
+        .in("role", ["user", "assistant"]).order("created_at", { ascending: true }).limit(20),
+      db.from("profiles").select("canton, municipality, marital_status, confession, account_type").eq("id", user.id).maybeSingle(),
+      db.from("categories").select("name").eq("user_id", user.id).order("name"),
+    ]);
+
+    await db.from("tax_messages").insert({ conversation_id: convId, user_id: user.id, role: "user", content: message });
+
+    const kategorien = [...new Set((cats ?? []).map((c: any) => c.name))];
+    const messages: any[] = [
+      { role: "system", content: systemPrompt(profile, kategorien) },
+      ...(history ?? []).map((m: any) => ({ role: m.role, content: m.content })),
+      { role: "user", content: message },
+    ];
+
+    const ctx: Ctx = { db, userId: user.id, profile };
+    const protokoll: any[] = [];
+    let antwort = "";
+
+    for (let runde = 0; runde <= MAX_TOOL_ROUNDS; runde++) {
+      const data = await callMistral(apiKey, messages);
+      const msg = data.choices?.[0]?.message;
+      const calls = msg?.tool_calls ?? [];
+
+      if (!calls.length || runde === MAX_TOOL_ROUNDS) {
+        antwort = msg?.content || "Keine Antwort erhalten.";
+        break;
+      }
+
+      messages.push({ role: "assistant", content: msg.content ?? "", tool_calls: calls });
+
+      for (const call of calls) {
+        const name = call.function?.name;
+        let args: any = {};
+        try {
+          args = typeof call.function?.arguments === "string" ? JSON.parse(call.function.arguments || "{}") : (call.function?.arguments ?? {});
+        } catch { args = {}; }
+
+        let result: unknown;
+        let ok = true;
+        try {
+          result = await runTool(name, args, ctx);
+        } catch (e: any) {
+          ok = false;
+          result = { fehler: e?.message ?? String(e) };
+        }
+        protokoll.push({ werkzeug: name, argumente: args, ok, zeit: new Date().toISOString() });
+        messages.push({ role: "tool", tool_call_id: call.id, name, content: JSON.stringify(result) });
+      }
+    }
+
+    await db.from("tax_messages").insert({
+      conversation_id: convId, user_id: user.id, role: "assistant", content: antwort,
+      tool_calls: protokoll.length ? protokoll : null,
+      metadata: { model: MODEL, werkzeuge: protokoll.map((p) => p.werkzeug) },
+    });
+    await db.from("tax_conversations").update({ updated_at: new Date().toISOString() }).eq("id", convId);
+
+    return json({ response: antwort, conversation_id: convId, werkzeuge: protokoll.map((p) => p.werkzeug) });
+  } catch (err: any) {
+    if (err instanceof HttpError) return json({ error: err.message }, err.status);
+    console.error("ai-tax-advisor error:", err);
+    return json({ error: err?.message || "Internal error" }, 500);
   }
-
-  return Response.json({ ok: true, generated });
 });
