@@ -31,6 +31,18 @@ const MODELS = [
   "mistral-small-latest",
 ].filter((m, i, a): m is string => !!m && a.indexOf(m) === i);
 let aktivesModell: string | null = null; // gemerkt fuer die Lebensdauer der Instanz
+const gesperrteModelle = new Set<string>(); // vom Abo nicht erlaubt (403/404)
+
+// Mistral-Gratisplan: ca. 1 Anfrage pro Sekunde. Mindestabstand zwischen Aufrufen.
+const MIN_ABSTAND_MS = 1100;
+const MAX_RETRIES_429 = 3;
+let letzterAufruf = 0;
+const schlafen = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function drosseln() {
+  const warten = letzterAufruf + MIN_ABSTAND_MS - Date.now();
+  if (warten > 0) await schlafen(warten);
+  letzterAufruf = Date.now();
+}
 const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
 const MAX_TOOL_ROUNDS = 6;
 const SUPPORTED_CANTONS = ["ZH", "TG"];
@@ -413,27 +425,42 @@ class HttpError extends Error {
 }
 
 async function callMistral(apiKey: string, messages: any[]) {
-  const kandidaten = aktivesModell ? [aktivesModell, ...MODELS.filter((m) => m !== aktivesModell)] : MODELS;
+  const reihenfolge = aktivesModell ? [aktivesModell, ...MODELS.filter((m) => m !== aktivesModell)] : MODELS;
+  const kandidaten = reihenfolge.filter((m) => !gesperrteModelle.has(m));
+  let ratenlimitErreicht = false;
 
   for (const model of kandidaten) {
-    const resp = await fetch(MISTRAL_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
-    });
-    if (resp.ok) {
-      if (aktivesModell !== model) console.log(`Mistral-Modell aktiv: ${model}`);
-      aktivesModell = model;
-      return { ...(await resp.json()), _model: model };
+    for (let versuch = 0; versuch <= MAX_RETRIES_429; versuch++) {
+      await drosseln();
+      const resp = await fetch(MISTRAL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
+      });
+      if (resp.ok) {
+        if (aktivesModell !== model) console.log(`Mistral-Modell aktiv: ${model}`);
+        aktivesModell = model;
+        return { ...(await resp.json()), _model: model };
+      }
+      const txt = await resp.text();
+      console.error("Mistral-Fehler", model, resp.status, `Versuch ${versuch + 1}`, txt);
+
+      if (resp.status === 429) {
+        // Zu schnell: warten und dasselbe Modell nochmals versuchen
+        ratenlimitErreicht = true;
+        if (versuch < MAX_RETRIES_429) { await schlafen(2000 * (versuch + 1)); continue; }
+        break; // naechstes Modell versuchen
+      }
+      // Modell im Abo nicht verfuegbar oder unbekannt -> merken und naechstes Modell
+      if (resp.status === 403 || resp.status === 404 || (resp.status === 400 && /model/i.test(txt))) {
+        gesperrteModelle.add(model);
+        break;
+      }
+      if (resp.status === 401) throw new HttpError(500, "MISTRAL_API_KEY ungueltig.");
+      throw new HttpError(502, `KI-Dienst nicht erreichbar (${resp.status}).`);
     }
-    const txt = await resp.text();
-    console.error("Mistral-Fehler", model, resp.status, txt);
-    // Modell im Abo nicht verfuegbar oder unbekannt -> naechstes Modell
-    if (resp.status === 403 || resp.status === 404 || (resp.status === 400 && /model/i.test(txt))) continue;
-    if (resp.status === 429) throw new HttpError(429, "Rate limit erreicht, bitte spaeter nochmal.");
-    if (resp.status === 401) throw new HttpError(500, "MISTRAL_API_KEY ungueltig.");
-    throw new HttpError(502, `KI-Dienst nicht erreichbar (${resp.status}).`);
   }
+  if (ratenlimitErreicht) throw new HttpError(429, "Der KI-Dienst ist gerade ausgelastet. Bitte in einer Minute nochmals versuchen.");
   throw new HttpError(502, "Kein Mistral-Modell im aktuellen Abo verfuegbar.");
 }
 
