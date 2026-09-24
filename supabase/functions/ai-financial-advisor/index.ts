@@ -45,6 +45,8 @@ async function drosseln() {
 }
 const MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions";
 const MAX_TOOL_ROUNDS = 6;
+const MAX_OUTPUT_TOKENS = 1200;   // Kostenobergrenze pro Antwort
+const FEATURE = "tax_advisor";    // Schluessel in ai_limits
 const SUPPORTED_CANTONS = ["ZH", "TG"];
 
 const json = (body: unknown, status = 200) =>
@@ -435,7 +437,7 @@ async function callMistral(apiKey: string, messages: any[]) {
       const resp = await fetch(MISTRAL_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1 }),
+        body: JSON.stringify({ model, messages, tools: TOOLS, tool_choice: "auto", temperature: 0.1, max_tokens: MAX_OUTPUT_TOKENS }),
       });
       if (resp.ok) {
         if (aktivesModell !== model) console.log(`Mistral-Modell aktiv: ${model}`);
@@ -512,6 +514,18 @@ Deno.serve(async (req) => {
       db.from("categories").select("name").eq("user_id", user.id).order("name"),
     ]);
 
+    // Kostenbremse: Limits pro Nutzer und globales Monatsbudget (ai_limits)
+    const freigabe: any = await rpc(db, "ai_usage_begin", { _feature: FEATURE });
+    if (!freigabe?.erlaubt) {
+      const hinweis = freigabe?.meldung ?? "Der KI-Assistent ist gerade nicht verfuegbar.";
+      await db.from("tax_messages").insert([
+        { conversation_id: convId, user_id: user.id, role: "user", content: message },
+        { conversation_id: convId, user_id: user.id, role: "assistant", content: hinweis, metadata: { limit: freigabe?.grund } },
+      ]);
+      return json({ response: hinweis, conversation_id: convId, limit_erreicht: freigabe?.grund ?? true });
+    }
+    const usageId = freigabe.usage_id;
+
     await db.from("tax_messages").insert({ conversation_id: convId, user_id: user.id, role: "user", content: message });
 
     const kategorien = [...new Set((cats ?? []).map((c: any) => c.name))];
@@ -525,10 +539,14 @@ Deno.serve(async (req) => {
     const protokoll: any[] = [];
     let antwort = "";
     let modell = "";
+    let tokIn = 0, tokOut = 0;
 
+    try {
     for (let runde = 0; runde <= MAX_TOOL_ROUNDS; runde++) {
       const data = await callMistral(apiKey, messages);
       modell = data._model;
+      tokIn += Number(data.usage?.prompt_tokens ?? 0);
+      tokOut += Number(data.usage?.completion_tokens ?? 0);
       const msg = data.choices?.[0]?.message;
       const calls = msg?.tool_calls ?? [];
 
@@ -557,6 +575,13 @@ Deno.serve(async (req) => {
         protokoll.push({ werkzeug: name, argumente: args, ok, zeit: new Date().toISOString() });
         messages.push({ role: "tool", tool_call_id: call.id, name, content: JSON.stringify(result) });
       }
+    }
+    } finally {
+      // Verbrauch immer nachtragen, auch wenn eine Runde fehlschlaegt
+      const { error: recErr } = await db.rpc("ai_usage_record", {
+        _usage_id: usageId, _model: modell || "unbekannt", _input_tokens: tokIn, _output_tokens: tokOut,
+      });
+      if (recErr) console.error("ai_usage_record:", recErr.message);
     }
 
     await db.from("tax_messages").insert({
